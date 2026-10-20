@@ -229,6 +229,47 @@ TEST_F(LibraryTest, InetNtoP) {
   EXPECT_EQ("1.2.3.4", std::string(buffer));
 }
 
+TEST_F(LibraryTest, InetNtoPPresentation)
+{
+  struct in_addr  a4;
+  struct in6_addr a6;
+  char            buffer[64];
+
+  struct {
+    char          text[16];
+    unsigned char guard;
+  } slot;
+
+  a4.s_addr = htonl(0x01020304);
+  EXPECT_EQ(nullptr, ares_inet_ntop(AF_INET, &a4, buffer, 15));
+
+  memset(&slot, 0x5a, sizeof(slot));
+  EXPECT_EQ(slot.text,
+            ares_inet_ntop(AF_INET, &a4, slot.text, sizeof(slot.text)));
+  EXPECT_STREQ("1.2.3.4", slot.text);
+  EXPECT_EQ(0x5a, slot.guard);
+
+  ASSERT_EQ(1, ares_inet_pton(AF_INET6, "::1", &a6));
+  EXPECT_EQ(buffer, ares_inet_ntop(AF_INET6, &a6, buffer, sizeof(buffer)));
+  EXPECT_STREQ("::1", buffer);
+  EXPECT_EQ(buffer, ares_inet_ntop(AF_INET6, &a6, buffer, 4));
+  EXPECT_STREQ("::1", buffer);
+  EXPECT_EQ(nullptr, ares_inet_ntop(AF_INET6, &a6, buffer, 3));
+
+  ASSERT_EQ(1, ares_inet_pton(AF_INET6, "2001:db8::1", &a6));
+  EXPECT_EQ(buffer, ares_inet_ntop(AF_INET6, &a6, buffer, sizeof(buffer)));
+  EXPECT_STREQ("2001:db8::1", buffer);
+
+  ASSERT_EQ(1, ares_inet_pton(AF_INET6, "::ffff:192.0.2.1", &a6));
+  EXPECT_EQ(buffer, ares_inet_ntop(AF_INET6, &a6, buffer, sizeof(buffer)));
+  EXPECT_STREQ("::ffff:192.0.2.1", buffer);
+
+  ASSERT_EQ(1, ares_inet_pton(AF_INET6,
+                              "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", &a6));
+  EXPECT_EQ(buffer, ares_inet_ntop(AF_INET6, &a6, buffer, sizeof(buffer)));
+  EXPECT_STREQ("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff", buffer);
+}
+
 TEST_F(LibraryTest, Mkquery) {
   byte* p;
   int len;

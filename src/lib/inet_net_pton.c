@@ -49,6 +49,60 @@
 const struct ares_in6_addr ares_in6addr_any = { { { 0, 0, 0, 0, 0, 0, 0, 0, 0,
                                                     0, 0, 0, 0, 0, 0, 0 } } };
 
+/* Wrap a NUL-terminated string. Empty input yields NULL with *len == 0;
+ * allocation failure yields NULL with *len > 0. */
+static ares_buf_t *open_text(const char *src, size_t *len)
+{
+  *len = ares_strlen(src);
+  if (*len == 0) {
+    return NULL;
+  }
+  return ares_buf_create_const((const unsigned char *)src, *len);
+}
+
+static void fail_open(size_t len)
+{
+  if (len == 0) {
+    SET_SOCKERRNO(ENOENT);
+  } else {
+    SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+}
+
+/* Fetch one byte. At the end of the buffer, *ch is 0 and the result is false,
+ * matching a read of the terminating NUL that was not stored in the buffer. */
+static ares_bool_t take_byte(ares_buf_t *buf, unsigned char *ch)
+{
+  if (ares_buf_fetch_bytes(buf, ch, 1) != ARES_SUCCESS) {
+    *ch = 0;
+    return ARES_FALSE;
+  }
+  return ARES_TRUE;
+}
+
+static int hex_value(unsigned char ch)
+{
+  if (ares_isdigit(ch)) {
+    return (int)(ch - '0');
+  }
+  if (ch >= 'a' && ch <= 'f') {
+    return (int)(ch - 'a' + 10);
+  }
+  if (ch >= 'A' && ch <= 'F') {
+    return (int)(ch - 'A' + 10);
+  }
+  return -1;
+}
+
+static ares_status_t append_octet(ares_buf_t *octets, size_t size,
+                                  unsigned char b)
+{
+  if (ares_buf_len(octets) >= size) {
+    return ARES_EBADRESP;
+  }
+  return ares_buf_append_byte(octets, b);
+}
+
 /*
  * static int
  * inet_net_pton_ipv4(src, dst, size, allow_cidr)
@@ -74,73 +128,122 @@ const struct ares_in6_addr ares_in6addr_any = { { { 0, 0, 0, 0, 0, 0, 0, 0, 0,
 static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
                                    size_t size, ares_bool_t allow_cidr)
 {
-  static const char    xdigits[] = "0123456789abcdef";
-  static const char    digits[]  = "0123456789";
+  ares_buf_t          *in     = NULL;
+  ares_buf_t          *octets = NULL;
+  size_t               len;
+  unsigned char        ch;
+  unsigned char        first = 0;
+  const unsigned char *look;
+  size_t               look_len;
   int                  n;
-  int                  ch;
   int                  tmp = 0;
   int                  dirty;
   int                  bits;
-  const unsigned char *odst = dst;
+  int                  result = -1;
+  ares_status_t        status;
+  ares_bool_t          saw_octet = ARES_FALSE;
 
   memset(dst, 0, size);
-  ch = *src++;
-  if (ch == '0' && (src[0] == 'x' || src[0] == 'X') && ares_isascii(src[1]) &&
-      ares_isxdigit(src[1])) {
+
+  in = open_text(src, &len);
+  if (in == NULL) {
+    fail_open(len);
+    return -1;
+  }
+
+  octets = ares_buf_create();
+  if (octets == NULL) {
+    SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+    goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
+  if (!take_byte(in, &ch)) {
+    goto enoent; /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+
+  look = ares_buf_peek(in, &look_len);
+  if (ch == '0' && look != NULL && look_len >= 2 &&
+      (look[0] == 'x' || look[0] == 'X') && ares_isascii(look[1]) &&
+      ares_isxdigit(look[1])) {
     /* Hexadecimal: Eat nybble string. */
-    if (!size) {
+    if (size == 0) {
       goto emsgsize;
     }
+    if (ares_buf_consume(in, 1) != ARES_SUCCESS) {
+      goto enoent; /* LCOV_EXCL_LINE: DefensiveCoding */
+    }
     dirty = 0;
-    src++; /* skip x or X. */
-    while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isxdigit(ch)) {
+    while (take_byte(in, &ch) && ares_isascii(ch) && ares_isxdigit(ch)) {
       if (ares_isupper(ch)) {
-        ch = ares_tolower((unsigned char)ch);
+        ch = ares_tolower(ch);
       }
-      n = (int)(strchr(xdigits, ch) - xdigits);
+      n = hex_value(ch);
       if (dirty == 0) {
         tmp = n;
       } else {
         tmp = (tmp << 4) | n;
       }
       if (++dirty == 2) {
-        if (!size--) {
+        status = append_octet(octets, size, (unsigned char)tmp);
+        if (status == ARES_EBADRESP) {
           goto emsgsize;
         }
-        *dst++ = (unsigned char)tmp;
-        dirty  = 0;
+        if (status != ARES_SUCCESS) {
+          SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+          goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+        }
+        if (!saw_octet) {
+          first     = (unsigned char)tmp;
+          saw_octet = ARES_TRUE;
+        }
+        dirty = 0;
       }
     }
     if (dirty) { /* Odd trailing nybble? */
-      if (!size--) {
+      status = append_octet(octets, size, (unsigned char)(tmp << 4));
+      if (status == ARES_EBADRESP) {
         goto emsgsize;
       }
-      *dst++ = (unsigned char)(tmp << 4);
+      if (status != ARES_SUCCESS) {
+        SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+        goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+      }
+      if (!saw_octet) {
+        first     = (unsigned char)(tmp << 4);
+        saw_octet = ARES_TRUE;
+      }
     }
   } else if (ares_isascii(ch) && ares_isdigit(ch)) {
     /* Decimal: eat dotted digit string. */
     for (;;) {
       tmp = 0;
       do {
-        n    = (int)(strchr(digits, ch) - digits);
+        n    = (int)(ch - '0');
         tmp *= 10;
         tmp += n;
         if (tmp > 255) {
           goto enoent;
         }
-      } while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isdigit(ch));
-      if (!size--) {
+      } while (take_byte(in, &ch) && ares_isascii(ch) && ares_isdigit(ch));
+      status = append_octet(octets, size, (unsigned char)tmp);
+      if (status == ARES_EBADRESP) {
         goto emsgsize;
       }
-      *dst++ = (unsigned char)tmp;
+      if (status != ARES_SUCCESS) {
+        SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+        goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+      }
+      if (!saw_octet) {
+        first     = (unsigned char)tmp;
+        saw_octet = ARES_TRUE;
+      }
       if (ch == '\0' || ch == '/') {
         break;
       }
       if (ch != '.') {
         goto enoent;
       }
-      ch = *src++;
-      if (!ares_isascii(ch) || !ares_isdigit(ch)) {
+      if (!take_byte(in, &ch) || !ares_isascii(ch) || !ares_isdigit(ch)) {
         goto enoent;
       }
     }
@@ -149,21 +252,32 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
   }
 
   bits = -1;
-  if (allow_cidr && ch == '/' && ares_isascii(src[0]) && ares_isdigit(src[0]) &&
-      dst > odst) {
-    /* CIDR width specifier.  Nothing can follow it. */
-    ch   = *src++; /* Skip over the /. */
-    bits = 0;
-    do {
-      n     = (int)(strchr(digits, ch) - digits);
-      bits *= 10;
-      bits += n;
-      if (bits > 32) {
+  if (allow_cidr && ch == '/' && saw_octet) {
+    look = ares_buf_peek(in, &look_len);
+    if (look != NULL && look_len > 0 && ares_isascii(look[0]) &&
+        ares_isdigit(look[0])) {
+      /* CIDR width specifier.  Nothing can follow it. */
+      bits = 0;
+      for (;;) {
+        if (!take_byte(in, &ch) || !ares_isdigit(ch)) {
+          goto enoent; /* LCOV_EXCL_LINE: DefensiveCoding */
+        }
+        n     = (int)(ch - '0');
+        bits *= 10;
+        bits += n;
+        if (bits > 32) {
+          goto enoent;
+        }
+        look = ares_buf_peek(in, &look_len);
+        if (look == NULL || !ares_isdigit(look[0])) {
+          break;
+        }
+      }
+      /* A non-digit after the width is not a prefix length. */
+      if (ares_buf_len(in) != 0) {
         goto enoent;
       }
-    } while ((ch = *src++) != '\0' && ares_isascii(ch) && ares_isdigit(ch));
-    if (ch != '\0') {
-      goto enoent;
+      ch = 0;
     }
   }
 
@@ -173,77 +287,106 @@ static int ares_inet_net_pton_ipv4(const char *src, unsigned char *dst,
   }
 
   /* If nothing was written to the destination, we found no address. */
-  if (dst == odst) {
-    goto enoent; /* LCOV_EXCL_LINE: all valid paths above increment dst */
+  if (!saw_octet) {
+    goto enoent; /* LCOV_EXCL_LINE: all valid paths above append an octet */
   }
+
   /* If no CIDR spec was given, infer width from net class. */
   if (bits == -1) {
-    if (*odst >= 240) {        /* Class E */
+    if (first >= 240) {        /* Class E */
       bits = 32;
-    } else if (*odst >= 224) { /* Class D */
+    } else if (first >= 224) { /* Class D */
       bits = 8;
-    } else if (*odst >= 192) { /* Class C */
+    } else if (first >= 192) { /* Class C */
       bits = 24;
-    } else if (*odst >= 128) { /* Class B */
+    } else if (first >= 128) { /* Class B */
       bits = 16;
     } else {                   /* Class A */
       bits = 8;
     }
     /* If imputed mask is narrower than specified octets, widen. */
-    if (bits < ((dst - odst) * 8)) {
-      bits = (int)(dst - odst) * 8;
+    if (bits < (int)(ares_buf_len(octets) * 8)) {
+      bits = (int)ares_buf_len(octets) * 8;
     }
     /*
      * If there are no additional bits specified for a class D
      * address adjust bits to 4.
      */
-    if (bits == 8 && *odst == 224) {
+    if (bits == 8 && first == 224) {
       bits = 4;
     }
   }
-  /* Extend network to cover the actual mask. */
-  while (bits > ((dst - odst) * 8)) {
-    if (!size--) {
+
+  /* Extend network to cover the actual mask. IPv4 prefixes are at most 32
+   * bits, so four octets are always enough and the length multiply cannot
+   * wrap. */
+  while (ares_buf_len(octets) < 4 && bits > (int)(ares_buf_len(octets) * 8)) {
+    status = append_octet(octets, size, 0);
+    if (status == ARES_EBADRESP) {
       goto emsgsize;
     }
-    *dst++ = '\0';
+    if (status != ARES_SUCCESS) {
+      SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+      goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+    }
   }
-  return bits;
+
+  {
+    size_t         blen  = 0;
+    unsigned char *bytes = ares_buf_finish_bin(octets, &blen);
+
+    if (bytes == NULL) {
+      SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+      goto done;             /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+    octets = NULL;
+    if (blen > size) {
+      ares_free(bytes); /* LCOV_EXCL_LINE: DefensiveCoding */
+      goto emsgsize;    /* LCOV_EXCL_LINE: DefensiveCoding */
+    }
+    if (blen > 0) {
+      memcpy(dst, bytes, blen);
+    }
+    ares_free(bytes);
+  }
+  result = bits;
+  goto done;
 
 enoent:
   SET_SOCKERRNO(ENOENT);
-  return -1;
+  result = -1;
+  goto done;
 
 emsgsize:
   SET_SOCKERRNO(EMSGSIZE);
-  return -1;
+  result = -1;
+
+done:
+  ares_buf_destroy(in);
+  ares_buf_destroy(octets);
+  return result;
 }
 
-static int getbits(const char *src, size_t *bitsp)
+static int getbits(ares_buf_t *src, size_t *bitsp)
 {
-  static const char digits[] = "0123456789";
-  size_t            n;
-  size_t            val;
-  char              ch;
+  size_t        n;
+  size_t        val;
+  unsigned char ch;
 
   val = 0;
   n   = 0;
-  while ((ch = *src++) != '\0') {
-    const char *pch;
-
-    pch = strchr(digits, ch);
-    if (pch != NULL) {
-      if (n++ != 0 && val == 0) { /* no leading zeros */
-        return 0;
-      }
-      val *= 10;
-      val += (size_t)(pch - digits);
-      if (val > 128) { /* range */
-        return 0;
-      }
-      continue;
+  while (take_byte(src, &ch)) {
+    if (!ares_isdigit(ch)) {
+      return 0;
     }
-    return 0;
+    if (n++ != 0 && val == 0) { /* no leading zeros */
+      return 0;
+    }
+    val *= 10;
+    val += (size_t)(ch - '0');
+    if (val > 128) { /* range */
+      return 0;
+    }
   }
   if (n == 0) {
     return 0;
@@ -254,73 +397,83 @@ static int getbits(const char *src, size_t *bitsp)
 
 static int ares_inet_pton6(const char *src, unsigned char *dst)
 {
-  static const char xdigits_l[] = "0123456789abcdef";
-  static const char xdigits_u[] = "0123456789ABCDEF";
-  unsigned char     tmp[NS_IN6ADDRSZ];
-  unsigned char    *tp;
-  unsigned char    *endp;
-  unsigned char    *colonp;
-  const char       *xdigits;
-  const char       *curtok;
-  int               ch;
-  int               saw_xdigit;
-  int               count_xdigit;
-  unsigned int      val;
+  ares_buf_t   *in = NULL;
+  unsigned char tmp[NS_IN6ADDRSZ];
+  size_t        tp;
+  size_t        colon_at = 0;
+  size_t        tok;
+  size_t        len;
+  size_t        n;
+  size_t        i;
+  int           saw_xdigit;
+  int           count_xdigit;
+  unsigned int  val;
+  unsigned char ch;
+  int           hv;
+  ares_bool_t   have_colon = ARES_FALSE;
+  int           result     = -1;
 
-  memset((tp = tmp), '\0', NS_IN6ADDRSZ);
-  endp   = tp + NS_IN6ADDRSZ;
-  colonp = NULL;
+  memset(tmp, 0, sizeof(tmp));
+  tp = 0;
+
+  in = open_text(src, &len);
+  if (in == NULL) {
+    fail_open(len);
+    return -1;
+  }
+
   /* Leading :: requires some special handling. */
-  if (*src == ':') {
-    if (*++src != ':') {
+  if (ares_buf_begins_with(in, (const unsigned char *)":", 1)) {
+    if (ares_buf_consume(in, 1) != ARES_SUCCESS ||
+        !ares_buf_begins_with(in, (const unsigned char *)":", 1)) {
       goto enoent;
     }
   }
-  curtok     = src;
-  saw_xdigit = count_xdigit = 0;
-  val                       = 0;
-  while ((ch = *src++) != '\0') {
-    const char *pch;
 
-    if ((pch = strchr((xdigits = xdigits_l), ch)) == NULL) {
-      pch = strchr((xdigits = xdigits_u), ch);
-    }
-    if (pch != NULL) {
+  tok          = ares_buf_get_position(in);
+  saw_xdigit   = 0;
+  count_xdigit = 0;
+  val          = 0;
+  while (take_byte(in, &ch)) {
+    hv = hex_value(ch);
+    if (hv >= 0) {
       if (count_xdigit >= 4) {
         goto enoent;
       }
       val <<= 4;
-      val  |= (unsigned int)(pch - xdigits);
+      val  |= (unsigned int)hv;
       if (val > 0xffff) {
-        goto enoent;
+        goto enoent; /* LCOV_EXCL_LINE: DefensiveCoding */
       }
       saw_xdigit = 1;
       count_xdigit++;
       continue;
     }
     if (ch == ':') {
-      curtok = src;
+      tok = ares_buf_get_position(in);
       if (!saw_xdigit) {
-        if (colonp) {
+        if (have_colon) {
           goto enoent;
         }
-        colonp = tp;
+        colon_at   = tp;
+        have_colon = ARES_TRUE;
         continue;
-      } else if (*src == '\0') {
+      } else if (ares_buf_len(in) == 0) {
         goto enoent;
       }
-      if (tp + NS_INT16SZ > endp) {
+      if (tp + NS_INT16SZ > NS_IN6ADDRSZ) {
         goto enoent;
       }
-      *tp++        = (unsigned char)(val >> 8) & 0xff;
-      *tp++        = (unsigned char)val & 0xff;
+      tmp[tp++]    = (unsigned char)((val >> 8) & 0xff);
+      tmp[tp++]    = (unsigned char)(val & 0xff);
       saw_xdigit   = 0;
       count_xdigit = 0;
       val          = 0;
       continue;
     }
-    if (ch == '.' && ((tp + NS_INADDRSZ) <= endp) &&
-        ares_inet_net_pton_ipv4(curtok, tp, NS_INADDRSZ, ARES_FALSE) > 0) {
+    if (ch == '.' && (tp + NS_INADDRSZ) <= NS_IN6ADDRSZ &&
+        ares_inet_net_pton_ipv4(src + tok, tmp + tp, NS_INADDRSZ, ARES_FALSE) >
+          0) {
       tp         += NS_INADDRSZ;
       saw_xdigit  = 0;
       break; /* '\0' was seen by inet_pton4(). */
@@ -328,74 +481,98 @@ static int ares_inet_pton6(const char *src, unsigned char *dst)
     goto enoent;
   }
   if (saw_xdigit) {
-    if (tp + NS_INT16SZ > endp) {
+    if (tp + NS_INT16SZ > NS_IN6ADDRSZ) {
       goto enoent;
     }
-    *tp++ = (unsigned char)(val >> 8) & 0xff;
-    *tp++ = (unsigned char)val & 0xff;
+    tmp[tp++] = (unsigned char)((val >> 8) & 0xff);
+    tmp[tp++] = (unsigned char)(val & 0xff);
   }
-  if (colonp != NULL) {
+  if (have_colon) {
     /*
      * Since some memmove()'s erroneously fail to handle
      * overlapping regions, we'll do the shift by hand.
      */
-    const int n = (int)(tp - colonp);
-    int       i;
-
-    if (tp == endp) {
+    if (tp == NS_IN6ADDRSZ) {
       goto enoent;
     }
+    n = tp - colon_at;
     for (i = 1; i <= n; i++) {
-      endp[-i]      = colonp[n - i];
-      colonp[n - i] = 0;
+      tmp[NS_IN6ADDRSZ - i] = tmp[colon_at + n - i];
+      tmp[colon_at + n - i] = 0;
     }
-    tp = endp;
+    tp = NS_IN6ADDRSZ;
   }
-  if (tp != endp) {
+  if (tp != NS_IN6ADDRSZ) {
     goto enoent;
   }
 
   memcpy(dst, tmp, NS_IN6ADDRSZ);
-  return 1;
+  result = 1;
+  goto done;
 
 enoent:
   SET_SOCKERRNO(ENOENT);
-  return -1;
+  result = -1;
+
+done:
+  ares_buf_destroy(in);
+  return result;
 }
 
 static int ares_inet_net_pton_ipv6(const char *src, unsigned char *dst,
                                    size_t size)
 {
-  struct ares_in6_addr in6;
-  int                  ret;
-  size_t               bits;
-  size_t               bytes;
-  char                 buf[INET6_ADDRSTRLEN + sizeof("/128")];
-  char                *sep;
+  ares_buf_t                *in = NULL;
+  struct ares_in6_addr       in6;
+  int                        ret;
+  size_t                     bits;
+  size_t                     bytes;
+  size_t                     len;
+  size_t                     addr_len;
+  char                       addr[INET6_ADDRSTRLEN + sizeof("/128")];
+  const unsigned char       *look;
+  size_t                     look_len;
+  static const unsigned char slash[1] = { '/' };
 
-  if (ares_strlen(src) >= sizeof buf) {
+  len = ares_strlen(src);
+  if (len >= sizeof(addr)) {
     SET_SOCKERRNO(EMSGSIZE);
     return -1;
   }
-  ares_strcpy(buf, src, sizeof buf);
 
-  sep = strchr(buf, '/');
-  if (sep != NULL) {
-    *sep++ = '\0';
-  }
-
-  ret = ares_inet_pton6(buf, (unsigned char *)&in6);
-  if (ret != 1) {
+  in = open_text(src, &len);
+  if (in == NULL) {
+    fail_open(len);
     return -1;
   }
 
-  if (sep == NULL) {
-    bits = 128;
-  } else {
-    if (!getbits(sep, &bits)) {
+  ares_buf_tag(in);
+  (void)ares_buf_consume_until_charset(in, slash, 1, ARES_FALSE);
+  addr_len = ares_buf_tag_length(in);
+  if (addr_len >= sizeof(addr)) {
+    SET_SOCKERRNO(EMSGSIZE); /* LCOV_EXCL_LINE: DefensiveCoding */
+    ares_buf_destroy(in);    /* LCOV_EXCL_LINE: DefensiveCoding */
+    return -1;               /* LCOV_EXCL_LINE: DefensiveCoding */
+  }
+  memcpy(addr, src, addr_len);
+  addr[addr_len] = '\0';
+
+  look = ares_buf_peek(in, &look_len);
+  if (look != NULL && look_len > 0 && look[0] == '/') {
+    if (ares_buf_consume(in, 1) != ARES_SUCCESS || !getbits(in, &bits)) {
       SET_SOCKERRNO(ENOENT);
+      ares_buf_destroy(in);
       return -1;
     }
+  } else {
+    bits = 128;
+  }
+  ares_buf_destroy(in);
+  in = NULL;
+
+  ret = ares_inet_pton6(addr, (unsigned char *)&in6);
+  if (ret != 1) {
+    return -1;
   }
 
   bytes = (bits + 7) / 8;

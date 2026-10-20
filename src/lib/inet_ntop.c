@@ -53,6 +53,62 @@
 static const char *inet_ntop4(const unsigned char *src, char *dst, size_t size);
 static const char *inet_ntop6(const unsigned char *src, char *dst, size_t size);
 
+/* RFC 5952 requires lowercase hex. ares_buf_append_num_hex() emits uppercase.
+ */
+static ares_status_t append_hex_group(ares_buf_t *buf, unsigned int word)
+{
+  static const char hexdig[] = "0123456789abcdef";
+  char              tmp[4];
+  size_t            n;
+  size_t            i;
+  unsigned int      v;
+  ares_status_t     status;
+
+  v = word;
+  if (v == 0) {
+    return ares_buf_append_byte(buf, '0');
+  }
+
+  n = 0;
+  while (v != 0 && n < sizeof(tmp)) {
+    tmp[n++]   = hexdig[v & 0x0f];
+    v        >>= 4;
+  }
+
+  for (i = n; i > 0; i--) {
+    status = ares_buf_append_byte(buf, (unsigned char)tmp[i - 1]);
+    if (status != ARES_SUCCESS) {
+      return status; /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+  return ARES_SUCCESS;
+}
+
+static const char *finish_presentation(ares_buf_t *buf, char *dst, size_t size)
+{
+  char  *str;
+  size_t slen = 0;
+
+  str = ares_buf_finish_str(buf, &slen);
+  if (str == NULL) {
+    /* finish_str() frees buf only after it has taken the allocation. */
+    ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+    SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+    return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
+  /* slen does not include the trailing NUL. */
+  if (slen + 1 > size) {
+    ares_free(str);
+    SET_SOCKERRNO(ENOSPC);
+    return NULL;
+  }
+
+  ares_strcpy(dst, str, size);
+  ares_free(str);
+  return dst;
+}
+
 /* char *
  * inet_ntop(af, src, dst, size)
  *     convert a network format address to presentation format.
@@ -89,21 +145,41 @@ const char *ares_inet_ntop(int af, const void *src, char *dst,
  */
 static const char *inet_ntop4(const unsigned char *src, char *dst, size_t size)
 {
-  static const char fmt[] = "%u.%u.%u.%u";
-  char              tmp[sizeof("255.255.255.255")];
+  ares_buf_t   *buf;
+  ares_status_t status;
+  size_t        i;
 
-  if (size < sizeof(tmp)) {
+  /* Historical contract: the destination must be able to hold the longest
+   * IPv4 presentation form, not merely this particular address. */
+  if (size < sizeof("255.255.255.255")) {
     SET_SOCKERRNO(ENOSPC);
     return NULL;
   }
 
-  if ((size_t)snprintf(tmp, sizeof(tmp), fmt, src[0], src[1], src[2], src[3]) >=
-      size) {
-    SET_SOCKERRNO(ENOSPC);
-    return NULL;
+  buf = ares_buf_create();
+  if (buf == NULL) {
+    SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+    return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
   }
-  ares_strcpy(dst, tmp, size);
-  return dst;
+
+  for (i = 0; i < 4; i++) {
+    if (i != 0) {
+      status = ares_buf_append_byte(buf, '.');
+      if (status != ARES_SUCCESS) {
+        ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+        SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+        return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+      }
+    }
+    status = ares_buf_append_num_dec(buf, src[i], 0);
+    if (status != ARES_SUCCESS) {
+      ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+      SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+      return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+    }
+  }
+
+  return finish_presentation(buf, dst, size);
 }
 
 /* const char *
@@ -121,16 +197,16 @@ static const char *inet_ntop6(const unsigned char *src, char *dst, size_t size)
    * Keep this in mind if you think this function should have been coded
    * to use pointer overlays.  All the world's not a VAX.
    */
-  char  tmp[sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255")];
-  char *tp;
-
   struct {
     ares_ssize_t base;
     size_t       len;
   } best, cur;
 
-  unsigned int words[NS_IN6ADDRSZ / NS_INT16SZ];
-  size_t       i;
+  unsigned int  words[NS_IN6ADDRSZ / NS_INT16SZ];
+  size_t        i;
+  ares_buf_t   *buf;
+  ares_status_t status;
+  char          v4[sizeof("255.255.255.255")];
 
   /*
    * Preprocess:
@@ -172,48 +248,71 @@ static const char *inet_ntop6(const unsigned char *src, char *dst, size_t size)
   }
 
   /*
-   * Format the result.
+   * Format the result through ares_buf so a mis-sized group cannot walk
+   * off a stack temporary.
    */
-  tp = tmp;
+  buf = ares_buf_create();
+  if (buf == NULL) {
+    SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+    return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+  }
+
   for (i = 0; i < (NS_IN6ADDRSZ / NS_INT16SZ); i++) {
     /* Are we inside the best run of 0x00's? */
     if (best.base != -1 && i >= (size_t)best.base &&
         i < ((size_t)best.base + best.len)) {
       if (i == (size_t)best.base) {
-        *tp++ = ':';
+        status = ares_buf_append_byte(buf, ':');
+        if (status != ARES_SUCCESS) {
+          ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+          SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+          return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+        }
       }
       continue;
     }
     /* Are we following an initial run of 0x00s or any real hex? */
     if (i != 0) {
-      *tp++ = ':';
+      status = ares_buf_append_byte(buf, ':');
+      if (status != ARES_SUCCESS) {
+        ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+        SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+        return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+      }
     }
     /* Is this address an encapsulated IPv4? */
     if (i == 6 && best.base == 0 &&
         (best.len == 6 || (best.len == 7 && words[7] != 0x0001) ||
          (best.len == 5 && words[5] == 0xffff))) {
-      if (!inet_ntop4(src + 12, tp, sizeof(tmp) - (size_t)(tp - tmp))) {
-        return (NULL);
+      if (inet_ntop4(src + 12, v4, sizeof(v4)) == NULL) {
+        ares_buf_destroy(buf);
+        return NULL;
       }
-      tp += ares_strlen(tp);
+      status = ares_buf_append_str(buf, v4);
+      if (status != ARES_SUCCESS) {
+        ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+        SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+        return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+      }
       break;
     }
-    tp += snprintf(tp, sizeof(tmp) - (size_t)(tp - tmp), "%x", words[i]);
+    status = append_hex_group(buf, words[i]);
+    if (status != ARES_SUCCESS) {
+      ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+      SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+      return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+    }
   }
   /* Was it a trailing run of 0x00's? */
   if (best.base != -1 &&
       ((size_t)best.base + best.len) == (NS_IN6ADDRSZ / NS_INT16SZ)) {
-    *tp++ = ':';
+    status = ares_buf_append_byte(buf, ':');
+    if (status != ARES_SUCCESS) {
+      ares_buf_destroy(buf); /* LCOV_EXCL_LINE: OutOfMemory */
+      SET_SOCKERRNO(ENOMEM); /* LCOV_EXCL_LINE: OutOfMemory */
+      return NULL;           /* LCOV_EXCL_LINE: OutOfMemory */
+    }
   }
-  *tp++ = '\0';
 
-  /*
-   * Check for overflow, copy, and we're done.
-   */
-  if ((size_t)(tp - tmp) > size) {
-    SET_SOCKERRNO(ENOSPC);
-    return NULL;
-  }
-  ares_strcpy(dst, tmp, size);
-  return dst;
+  return finish_presentation(buf, dst, size);
 }

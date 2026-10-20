@@ -299,6 +299,36 @@ TEST_F(LibraryTest, InetNetPtoNPrefixZeroFills) {
             AddressToString(a6, 16));
 }
 
+TEST_F(LibraryTest, InetPtoNBoundedWrite)
+{
+  struct {
+    unsigned char addr[4];
+    unsigned char guard;
+  } v4;
+
+  struct {
+    unsigned char addr[16];
+    unsigned char guard;
+  } v6;
+
+  memset(&v4, 0x5a, sizeof(v4));
+  EXPECT_EQ(1, ares_inet_pton(AF_INET, "255.254.253.252", v4.addr));
+  EXPECT_EQ(255, v4.addr[0]);
+  EXPECT_EQ(254, v4.addr[1]);
+  EXPECT_EQ(253, v4.addr[2]);
+  EXPECT_EQ(252, v4.addr[3]);
+  EXPECT_EQ(0x5a, v4.guard);
+
+  memset(&v6, 0x5a, sizeof(v6));
+  EXPECT_EQ(1, ares_inet_pton(AF_INET6, "2001:db8::1", v6.addr));
+  EXPECT_EQ(0x5a, v6.guard);
+
+  memset(&v6, 0x5a, sizeof(v6));
+  EXPECT_EQ(64, ares_inet_net_pton(AF_INET6, "2001:db8:1:2:3:4:5:6/64", v6.addr,
+                                   sizeof(v6.addr)));
+  EXPECT_EQ(0x5a, v6.guard);
+}
+
 TEST_F(LibraryTest, FreeLongChain) {
   struct ares_addr_node *data = nullptr;
   for (int ii = 0; ii < 100000; ii++) {
